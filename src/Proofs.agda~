@@ -1,0 +1,358 @@
+open import Data.Fin as F hiding (_≺_; _≥_) renaming (_≤_ to _≤ᶠ_)
+open import Data.Fin.Properties as F
+open import Data.List as L hiding (zipWith)
+open import Data.List.Membership.Propositional
+open import Data.List.Relation.Binary.Permutation.Propositional
+open import Data.List.Relation.Unary.All as All hiding (updateAt; zipWith)
+open import Data.Maybe hiding (zipWith)
+open import Data.Nat as ℕ
+open import Data.Product
+open import Data.Sum
+open import Data.Vec as V hiding (updateAt; zipWith; _++_; [_])
+open import Data.Vec.Functional hiding (_++_; _∷_) renaming ([] to ∅)
+open import Data.Vec.Functional.Properties
+open import Data.Vec.Functional.Relation.Binary.Pointwise 
+open import Data.Vec.Functional.Relation.Binary.Pointwise.Properties renaming (refl to pw-refl; sym to pw-sym; trans to pw-trans)
+open import Function
+open import Relation.Binary.PropositionalEquality renaming ([_] to ⟨_⟩)
+open import Relation.Nullary
+open import Relation.Nullary.Product
+open import Relation.Nullary.Implication
+open import Relation.Nullary.Negation
+
+module Proofs where
+
+
+data multi {X : Set} (R : X → X → Set) : X → X → Set where
+  mrefl : ∀{x} → multi R x x
+  miter : ∀{x y z} → multi R x y → R y z → multi R x z
+
+
+postulate
+  num-site : ℕ
+  MsgVal : Set
+
+
+Pid = Fin num-site
+
+Matrix : Set → ℕ → ℕ → Set
+Matrix A m n = Vector (Vector A n) m
+
+SqMatrix : Set → ℕ → Set
+SqMatrix A n = Matrix A n n
+
+{- Machinery for our server/process -}
+MState = SqMatrix ℕ num-site
+
+-- Map updates
+infixl 10 _[_←_]
+_[_←_] : ∀{A : Set} {n} → Vector A n → Fin n → A → Vector A n
+v [ i ← x ] = updateAt i (λ _ → x) v
+
+
+infixl 10 _[_،_←_]
+-- For assigning to the row-col in a matrix
+_[_،_←_] : ∀{A : Set} {n m} → Matrix A m n → Fin m → Fin n → A → Matrix A m n
+x [ i ، j ← e ] =
+  let row  = x i
+      row′ = row [ j ← e ]
+  in x [ i ← row′ ]
+
+-- the deliverability condition
+deliverable : Pid → MState → Pid → MState → Set
+deliverable i M j Mⱼ = (∀ k → k ≢ i → M k j ≤ Mⱼ k j) × (M i j ≡ ℕ.suc (Mⱼ i j))
+
+deliverable? : (i j : Pid) (M Mⱼ : MState) → Dec (deliverable i M j Mⱼ)
+deliverable? i j M Mⱼ = F.all? (λ x → ¬? (x F.≟ i) →-dec (M x j) ℕ.≤? (Mⱼ x j)) ×-dec (M i j ℕ.≟ suc (Mⱼ i j))
+
+-- The initial local state
+M₀ : MState
+M₀ = (λ i j → 0)
+
+tick : Pid → Pid → MState → MState
+tick i j M = M [ i ، j ← ℕ.suc (M i j) ]
+
+-- Merging two vectors, pointwise. A join operation
+infixl 12 _⋄_
+_⋄_ : ∀{n} → Vector ℕ n → Vector ℕ n → Vector ℕ n
+u ⋄ v = zipWith _⊔_ u v
+
+-- Join two matrices
+infixl 12 _⊔ₘ_
+_⊔ₘ_ : ∀{n} → SqMatrix ℕ n → SqMatrix ℕ n → SqMatrix ℕ n
+x ⊔ₘ y = zipWith (_⋄_) x y
+
+
+-- Commands to be executed
+data Com : Set where
+  send : Pid → MsgVal → Com
+
+Buffer = List (Pid × MsgVal)
+
+data Control : Set where
+  waiting-on : Pid → Control
+  ok : Control
+
+
+data Ack : Set where
+  ! : Ack
+
+Msgᴮ = (Pid × MsgVal) ⊎ (Pid × Ack)
+Msgᴹ = Pid × MState × MsgVal
+
+
+
+-- assuming decidable equality of messages
+postulate
+  _≟ₘᵇ_ : (msg msg′ : Msgᴮ) → Dec (msg ≡ msg′)
+  _≟ₘᵐ_ : (msg msg′ : Msgᴹ) → Dec (msg ≡ msg′)
+
+record ProcStateᵇ : Set where
+  constructor proc
+  field
+    outbuf⟨_⟩ : Control × Buffer
+    recvdᵇ[_] : Buffer
+
+open ProcStateᵇ public
+
+record ProcStateᵐ : Set where
+  constructor proc
+  field
+    stateᵐ⟨_⟩ : MState
+    recvdᵐ[_] : List (Pid × MState × MsgVal)
+
+open ProcStateᵐ public
+
+
+
+InputBuffersᵇ = Vector (List Msgᴮ) num-site
+InputBuffersᵐ = Vector (List Msgᴹ) num-site
+-- InputBuffersᵇ = List Msgᵇ
+-- InputBuffersᵐ = List Msgᵐ
+
+-- selects the lowest index in the vector which has non-empty contents
+lowest-nonempty : ∀{A : Set} {n : ℕ} → Vector (List A) n → Maybe (Fin n)
+lowest-nonempty u = go (toVec u)
+  where
+    go : ∀{A : Set} {n : ℕ} → Vec (List A) n → Maybe (Fin n)
+    go [] = nothing
+    go ([] ∷ xs) with go xs
+    ... | just x = just (suc x)
+    ... | nothing = nothing
+    go ((_ ∷ _) ∷ xs) = just zero
+
+
+-- Test case
+private
+  ex-vec : Vector (List ℕ) 3
+  ex-vec zero = L.[]
+  ex-vec (suc zero) = L.[ 3 ]
+  ex-vec (suc (suc i)) = L.[ 5 ]
+
+  example₁ : lowest-nonempty ex-vec ≡ just (suc zero)
+  example₁ = refl
+
+
+-- Definition of process states
+Procᵇ = (List Com) × ProcStateᵇ
+Procᵐ = (List Com) × ProcStateᵐ
+
+ChannelStatesᴮ = Pid → Pid → List Msgᴮ
+ChannelStatesᴹ = Pid → Pid → List Msgᴹ
+-- The definition of a system state
+Stateᴮ = (Pid → Procᵇ) × ChannelStatesᴮ
+Stateᴹ = (Pid → Procᵐ) × ChannelStatesᴹ
+
+infixl 3 _≈ₘ_
+-- Defining an equivalence between lists messages
+data _≈ₘ_ : List Msgᴮ → List Msgᴹ → Set where
+  empty : [] ≈ₘ []
+  same-msg : ∀{lᴮ lᴹ i M m} → lᴮ ≈ₘ lᴹ → (inj₁ (i , m) ∷ lᴮ) ≈ₘ ((i , M , m) ∷ lᴹ)
+  ignore-ack : ∀{lᴮ lᴹ i} →  lᴮ ≈ₘ lᴹ → (inj₂ (i , !) ∷ lᴮ) ≈ₘ lᴹ
+
+-- This lets us define an equivalence between channel states
+_≈c_ : ChannelStatesᴮ → ChannelStatesᴹ → Set
+b ≈c b′ = ∀ i j → b i j ≈ₘ b′ i j
+
+
+-- Given a channel state, retrieve all deliverable messages (buffer protocol)
+retrieveᴮ : Pid → (b : Pid → Pid → List Msgᴮ) → List Msgᴮ
+retrieveᴮ i b = L.concat (L.tabulate λ j → b j i)
+
+-- Given a channel state, retrieve all deliverable messages (matrix protocol)
+retrieveᴹ : (i : Pid) → (M : MState) → (b : Pid → Pid → List Msgᴹ) →
+            Σ[ l ∈ List Msgᴹ ] (∀ j Mⱼ m → (j , Mⱼ , m) ∈ l → deliverable i M j Mⱼ)
+retrieveᴹ i M b = {!!}
+
+
+-- Given a list of messages, get the list of received acknowledgements
+getAcks : Pid → List Msgᴮ → List Pid
+getAcks i [] = []
+getAcks i (inj₁ _ ∷ l) = getAcks i l
+getAcks i (inj₂ (j , !) ∷ l) = j ∷ getAcks i l
+
+-- Given a list of messages, get a list of values to be consumed
+getMsgs : Pid → List Msgᴮ → List (Pid × MsgVal)
+getMsgs i [] = []
+getMsgs i (inj₁ (j , m) ∷ l) = (j , m) ∷ getMsgs i l
+getMsgs i (inj₂ ( j , !) ∷ l) = getMsgs i l
+
+
+
+-- Given a list of messages
+
+
+-- The initital states for buffer protocol, depending on a map of commands
+s₀ᴮ⟨_⟩ : (coms : (Pid → List Com)) → Stateᴮ
+s₀ᴮ⟨ coms ⟩ = (λ i → coms i , proc (ok , []) []) , (λ i → λ j → [])
+
+-- Initial states for matrix protocol, depending on a map of commands
+s₀ᴹ⟨_⟩ : (coms : (Pid → List Com)) → Stateᴹ
+s₀ᴹ⟨ coms ⟩ = (λ i → coms i , proc M₀ []) , (λ i → λ j → [])
+
+-- Note that we have equivalent channel states by our definition
+initial⇒≈ₘ : ∀{coms} → ∀ i j → (proj₂ s₀ᴮ⟨ coms ⟩) i j ≈ₘ (proj₂ s₀ᴹ⟨ coms ⟩) i j
+initial⇒≈ₘ i j = empty
+
+insert-msg : Control × Buffer → Pid → MsgVal → Control × Buffer
+insert-msg (c , ob) j v = (c , ob L.++ L.[ (j , v) ])
+
+
+data Eventᴮ : Set where
+  send    : Pid → MsgVal → Eventᴮ
+  post    : Pid → MsgVal → Eventᴮ
+  ack     : Pid → Eventᴮ
+  recv    : List (Pid × MsgVal) → Eventᴮ
+
+
+
+data Eventᴹ : Set where
+  send : Pid → MsgVal → Eventᴹ
+  recv    : List (Pid × MState × MsgVal) → Eventᴹ
+
+
+-- Local step machine for process states in buffer protocol
+data _⊢_⟼ᴮ⟨_⟩_ (i : Pid) : Procᵇ → Eventᴮ → Procᵇ → Set where
+  sendR : ∀{coms ob r j m ob′} →
+          i ≢ j → ob′ ≡ insert-msg ob j m →
+          i ⊢ ((send j m ∷ coms) , proc ob r) ⟼ᴮ⟨ send j m ⟩ (coms , proc ob′ r)
+
+  postR : ∀{coms s j m msgs} →
+          i ≢ j →
+          outbuf⟨ s ⟩ ≡ (ok , (j , m) ∷ msgs) →
+          let s′ = record s {outbuf⟨_⟩ = (waiting-on j , msgs)}
+          in i ⊢ (coms , s) ⟼ᴮ⟨ post j m ⟩ (coms , s′)
+
+  ackR : ∀{coms s j msgs} →
+         i ≢ j → outbuf⟨ s ⟩ ≡ (waiting-on j , msgs) →
+         let s′ = record s {outbuf⟨_⟩ = (ok , msgs)}
+         in i ⊢ (coms , s) ⟼ᴮ⟨ ack j ⟩ (coms , s′)
+
+  recvR : ∀{coms s msgs} →
+           let s′ = record s {recvdᵇ[_] = recvdᵇ[ s ] ++ msgs}
+           in i ⊢ (coms , s) ⟼ᴮ⟨ recv msgs ⟩ (coms , s′)
+
+
+-- Local step machine for process states in the matrix protocol
+data _⊢_⟼ᴹ⟨_⟩_ (i : Pid) : Procᵐ → Eventᴹ → Procᵐ → Set where
+
+  sendR : ∀{coms M r j m M′} → M′ ≡ tick i j M →
+            i ⊢ (send j m ∷ coms , proc M r) ⟼ᴹ⟨ send j m ⟩ (coms , proc M′ r)
+
+  recvR : ∀{coms M r} {msgs} {r′ M′} →
+          All (λ ( j , Mⱼ , m) → deliverable i M j Mⱼ) msgs →
+          r′ ≡ r ++ msgs →
+          M′ ≡ L.foldr (λ (j , Mⱼ , m) → λ M → M ⊔ₘ Mⱼ) M msgs → 
+          i ⊢ (coms , proc M r) ⟼ᴹ⟨ recv msgs ⟩ (coms , proc M′ r′)
+          
+
+
+-- Global system state machine for Buffer protocol
+data _⟿ᴮ_ : Stateᴮ → Stateᴮ → Set where
+  sendR : ∀{Π Π′ b} {i j m coms coms′ sᵢ sᵢ′} →
+           Π i ≡ (coms , sᵢ) →
+           i ⊢ (coms , sᵢ) ⟼ᴮ⟨ send j m ⟩ (coms′ , sᵢ′) →
+           Π′ ≡ Π [ i ← (coms′ , sᵢ′) ] →
+           (Π , b) ⟿ᴮ (Π′ , b)
+
+  postR : ∀{Π Π′ b b′} {i j m coms sᵢ sᵢ′} →
+          Π i ≡ (coms , sᵢ) →
+          i ⊢ (coms , sᵢ) ⟼ᴮ⟨ post j m ⟩ (coms , sᵢ′) →
+          Π′ ≡ Π [ i ← (coms , sᵢ′) ] →
+          b′ ≡ b [ i ، j ← ((b i j) ++ [ inj₁ (i , m) ]) ] →
+          (Π , b) ⟿ᴮ (Π′ , b′)
+
+
+
+
+-- Global system state machine for matrix protocol
+data _⟿ᴹ_ : Stateᴹ → Stateᴹ → Set where
+  sendR : ∀{Π Π′ b b′} {i j m coms coms′ sᵢ sᵢ′} →
+          Π i ≡ (coms , sᵢ) →
+          i ≢ j →
+          i ⊢ (coms , sᵢ) ⟼ᴹ⟨ send j m ⟩ (coms′ , sᵢ′) →
+          Π′ ≡ Π [ i ← (coms′ , sᵢ′) ] →
+          b′ ≡ b [ i ، j ← ((b i j) ++ [ (i , stateᵐ⟨ sᵢ′ ⟩ , m) ]) ] →
+          (Π , b) ⟿ᴹ (Π′ , b′)
+
+
+-- defining iterated system steps and termination
+_⟿ᴮ*_ : Stateᴮ → Stateᴮ → Set
+_⟿ᴮ*_ = multi _⟿ᴮ_ 
+
+_⟿ᴹ*_ : Stateᴹ → Stateᴹ → Set
+_⟿ᴹ*_ = multi _⟿ᴹ_ 
+
+_⇓ᴮ_ : Stateᴮ → Stateᴮ → Set
+s ⇓ᴮ s′ = s ⟿ᴮ s′ × (¬ (∃[ s″ ] s′ ⟿ᴮ s″))
+
+_⇓ᴹ_ : Stateᴹ → Stateᴹ → Set
+s ⇓ᴹ s′ = s ⟿ᴹ s′ × (¬ (∃[ s″ ] s′ ⟿ᴹ s″))
+
+
+infixl 4 _≈_
+-- The equivalence relation between received messages
+data _≈_ : Buffer → List (Pid × MState × MsgVal) → Set where
+  base : [] ≈ []
+  induct : ∀ {rᵇ rᵐ j v M} → rᵇ ≈ rᵐ →  (j , v) ∷ rᵇ ≈ (j , M , v) ∷ rᵐ
+
+
+infix 3 _∼_
+-- Defining an equivalence between system states
+data _∼_ : Stateᴮ → Stateᴹ → Set where
+  initial : ∀{coms s₀ᴮ s₀ᴹ} → s₀ᴮ ≡ s₀ᴮ⟨ coms ⟩ → s₀ᴹ ≡ s₀ᴹ⟨ coms ⟩ → s₀ᴮ ∼ s₀ᴹ
+
+{-- Possible invariant to prove: the number of in-transit messages by the buffer protocol
+    is equal to the number of *deliverable* messages by the matrix protocol --}
+
+
+-- simulating sends
+module SendSimulation (coms : (Pid → List Com)) where
+  private
+    theorem : ∀{s} → s₀ᴮ⟨ coms ⟩ ⟿ᴮ* s → Σ[ s′ ∈ Stateᴹ ] (s₀ᴹ⟨ coms ⟩ ⟿ᴹ* s′) × (proj₂ s ≈c proj₂ s′)
+    theorem mrefl = s₀ᴹ⟨ coms ⟩ , mrefl , (λ x x₁ → empty)
+    theorem (miter p (sendR x x₁ x₂)) with theorem p
+    ... | s , fst , snd = {!!}
+    theorem (miter p (postR x x₁ x₂ x₃)) = {!!}
+
+unwrapᵇ : Buffer → List MsgVal
+unwrapᵇ = L.map proj₂
+
+unwrapᵐ : List (Pid × MState × MsgVal) → List MsgVal
+unwrapᵐ = L.map (proj₂ ∘ proj₂)
+
+-- for iterating a step function
+infixl 3 _*
+_* : ∀{X Z : Set} (f : X → Z → X) → (X → List Z → X)
+(step *) x [] = x
+(step *) x (z ∷ l) = (step *) (step x z) l
+
+obs-equiv-lemma₂ : ∀ {q q′} → q ≈ q′ → unwrapᵇ q ≡ unwrapᵐ q′
+obs-equiv-lemma₂ base = refl
+obs-equiv-lemma₂ (induct {j = j} {v = v} {M = M} q≈q′) = cong (v ∷_) (obs-equiv-lemma₂ q≈q′)
+
+-- This lemma will help imply theorem2
+obs-equiv-lemma₁ : ∀ {S : Set} {s : S} (step : S → MsgVal → S) (p : ProcStateᵇ) (p′ : ProcStateᵐ) →
+                   recvdᵇ[ p ] ≈ recvdᵐ[ p′ ] →
+                   (step *) s (unwrapᵇ recvdᵇ[ p ]) ≡ (step *) s (unwrapᵐ recvdᵐ[ p′ ])
+obs-equiv-lemma₁ {s = s} step p p′ rᵇ≈rᵐ = cong ((step *) s) (obs-equiv-lemma₂ rᵇ≈rᵐ)

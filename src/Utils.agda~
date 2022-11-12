@@ -1,0 +1,6 @@
+
+module Utils where
+
+
+data multi {X : Set} (R : X → X → Set) : X → X → Set where
+  refl : ∀{x : X} → multi R x x
